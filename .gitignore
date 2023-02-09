@@ -1,0 +1,12 @@
+venv
+*.swp
+*.swo
+*.pyc
+.DS_Store
+__pycache__
+dist
+src/docquery.egg-info
+docs
+.vscode/settings.json
+build
+venv

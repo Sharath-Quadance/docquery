@@ -1,0 +1,3 @@
+[console_scripts]
+docquery = docquery.cmd.__main__:main
+

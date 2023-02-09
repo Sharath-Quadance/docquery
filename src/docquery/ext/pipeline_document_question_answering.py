@@ -5,15 +5,9 @@ import re
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+from transformers.models.vision_encoder_decoder import VisionEncoderDecoderModel
 from transformers.pipelines.base import PIPELINE_INIT_ARGS, ChunkPipeline
-from transformers.utils import (
-    ExplicitEnum,
-    add_end_docstrings,
-    is_pytesseract_available,
-    is_torch_available,
-    is_vision_available,
-    logging,
-)
+from transformers.utils import add_end_docstrings, is_torch_available, logging
 
 from .itertools import unique_everseen
 from .qa_helpers import TESSERACT_LOADED, VISION_LOADED, Image, load_image, pytesseract, select_starts_ends
@@ -67,16 +61,9 @@ def apply_tesseract(image: "Image.Image", lang: Optional[str], tesseract_config:
     for box in actual_boxes:
         normalized_boxes.append(normalize_box(box, image_width, image_height))
 
-    if len(words) != len(normalized_boxes):
-        raise ValueError("Not as many words as there are bounding boxes")
+    assert len(words) == len(normalized_boxes), "Not as many words as there are bounding boxes"
 
     return words, normalized_boxes
-
-
-class ModelType(ExplicitEnum):
-    LayoutLM = "layoutlm"
-    LayoutLMv2andv3 = "layoutlmv2andv3"
-    VisionEncoderDecoder = "vision_encoder_decoder"
 
 
 ImageOrName = Union["Image.Image", str]
@@ -87,9 +74,8 @@ DEFAULT_MAX_ANSWER_LENGTH = 15
 class DocumentQuestionAnsweringPipeline(ChunkPipeline):
     # TODO: Update task_summary docs to include an example with document QA and then update the first sentence
     """
-    Document Question Answering pipeline using any `AutoModelForDocumentQuestionAnswering`. The inputs/outputs are
-    similar to the (extractive) question answering pipeline; however, the pipeline takes an image (and optional OCR'd
-    words/boxes) as input instead of text context.
+    Document Question Answering pipeline using any `AutoModelForDocumentQuestionAnswering`. See the [question answering
+    examples](../task_summary#question-answering) for more information.
 
     This document question answering pipeline can currently be loaded from [`pipeline`] using the following task
     identifier: `"document-question-answering"`.
@@ -101,16 +87,7 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.model.config.__class__.__name__ == "VisionEncoderDecoderConfig":
-            self.model_type = ModelType.VisionEncoderDecoder
-            if self.model.config.encoder.model_type != "donut-swin":
-                raise ValueError("Currently, the only supported VisionEncoderDecoder model is Donut")
-        else:
-            # self.check_model_type(MODEL_FOR_DOCUMENT_QUESTION_ANSWERING_MAPPING)
-            if self.model.config.__class__.__name__ == "LayoutLMConfig":
-                self.model_type = ModelType.LayoutLM
-            else:
-                self.model_type = ModelType.LayoutLMv2andv3
+        # self.check_model_type(MODEL_FOR_DOCUMENT_QUESTION_ANSWERING_MAPPING)
 
     def _sanitize_parameters(
         self,
@@ -161,8 +138,7 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
         """
         Answer the question(s) given as inputs by using the document(s). A document is defined as an image and an
         optional list of (word, box) tuples which represent the text in the document. If the `word_boxes` are not
-        provided, it will use the Tesseract OCR engine (if available) to extract the words and boxes automatically for
-        LayoutLM-like models which require them as input. For Donut, no OCR is run.
+        provided, it will use the Tesseract OCR engine (if available) to extract the words and boxes automatically.
 
         You can invoke the pipeline several ways:
 
@@ -185,9 +161,9 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                 A question to ask of the document.
             word_boxes (`List[str, Tuple[float, float, float, float]]`, *optional*):
                 A list of words and bounding boxes (normalized 0->1000). If you provide this optional input, then the
-                pipeline will use these words and boxes instead of running OCR on the image to derive them for models
-                that need them (e.g. LayoutLM). This allows you to reuse OCR'd results across many invocations of the
-                pipeline without having to re-run it each time.
+                pipeline will use these words and boxes instead of running OCR on the image to derive them. This allows
+                you to reuse OCR'd results across many invocations of the pipeline without having to re-run it each
+                time.
             top_k (`int`, *optional*, defaults to 1):
                 The number of answers to return (will be chosen by order of likelihood). Note that we return less than
                 top_k answers if there are not enough options available within the context.
@@ -212,10 +188,6 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
             A `dict` or a list of `dict`: Each result comes as a dictionary with the following keys:
 
             - **score** (`float`) -- The probability associated to the answer.
-            - **start** (`int`) -- The start word index of the answer (in the OCR'd version of the input or provided
-              `word_boxes`).
-            - **end** (`int`) -- The end word index of the answer (in the OCR'd version of the input or provided
-              `word_boxes`).
             - **answer** (`str`) -- The answer to the question.
             - **words** (`list[int]`) -- The index of each word/box pair that is in the answer
             - **page** (`int`) -- The page of the answer
@@ -225,7 +197,7 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
             image = image["image"]
 
         if isinstance(image, list):
-            normalized_images = (i if isinstance(i, (tuple, list)) else (i, None) for i in image)
+            normalized_images = (i if isinstance(i, tuple) or isinstance(i, list) else (i, None) for i in image)
         else:
             normalized_images = [(image, None)]
 
@@ -245,6 +217,8 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
         # NOTE: This code mirrors the code in question answering and will be implemented in a follow up PR
         # to support documents with enough tokens that overflow the model's window
         if max_seq_len is None:
+            # TODO: LayoutLM's stride is 512 by default. Is it ok to use that as the min
+            # instead of 384 (which the QA model uses)?
             max_seq_len = min(self.tokenizer.model_max_length, 512)
 
         if doc_stride is None:
@@ -253,16 +227,17 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
         for page_idx, (image, word_boxes) in enumerate(input["pages"]):
             image_features = {}
             if image is not None:
+                if not VISION_LOADED:
+                    raise ValueError(
+                        "If you provide an image, then the pipeline will run process it with PIL (Pillow), but"
+                        " PIL is not available. Install it with pip install Pillow."
+                    )
                 image = load_image(image)
                 if self.feature_extractor is not None:
                     image_features.update(self.feature_extractor(images=image, return_tensors=self.framework))
-                elif self.model_type == ModelType.VisionEncoderDecoder:
-                    raise ValueError(
-                        "If you are using a VisionEncoderDecoderModel, you must provide a feature extractor"
-                    )
 
             words, boxes = None, None
-            if not self.model_type == ModelType.VisionEncoderDecoder:
+            if not isinstance(self.model, VisionEncoderDecoderModel):
                 if word_boxes is not None:
                     words = [x[0] for x in word_boxes]
                     boxes = [x[1] for x in word_boxes]
@@ -289,7 +264,7 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                     f" {self.tokenizer.padding_side}"
                 )
 
-            if self.model_type == ModelType.VisionEncoderDecoder:
+            if isinstance(self.model, VisionEncoderDecoderModel):
                 task_prompt = f'<s_docvqa><s_question>{input["question"]}</s_question><s_answer>'
                 # Adapted from https://huggingface.co/spaces/nielsr/donut-docvqa/blob/main/app.py
                 encoding = {
@@ -297,6 +272,13 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                     "decoder_input_ids": self.tokenizer(
                         task_prompt, add_special_tokens=False, return_tensors=self.framework
                     ).input_ids,
+                    "max_length": self.model.decoder.config.max_position_embeddings,
+                    "early_stopping": True,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "use_cache": True,
+                    "num_beams": 1,
+                    "bad_words_ids": [[self.tokenizer.unk_token_id]],
                     "return_dict_in_generate": True,
                 }
 
@@ -309,27 +291,17 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                     "output_attentions": True,
                 }
             else:
-                tokenizer_kwargs = {}
-                if self.model_type == ModelType.LayoutLM:
-                    tokenizer_kwargs["text"] = input["question"].split()
-                    tokenizer_kwargs["text_pair"] = words
-                    tokenizer_kwargs["is_split_into_words"] = True
-                else:
-                    tokenizer_kwargs["text"] = [input["question"]]
-                    tokenizer_kwargs["text_pair"] = [words]
-                    tokenizer_kwargs["boxes"] = [boxes]
-
                 encoding = self.tokenizer(
+                    text=input["question"].split(),
+                    text_pair=words,
                     padding=padding,
                     max_length=max_seq_len,
                     stride=doc_stride,
+                    return_token_type_ids=True,
+                    is_split_into_words=True,
                     truncation="only_second",
                     return_overflowing_tokens=True,
-                    **tokenizer_kwargs,
                 )
-
-                if "pixel_values" in image_features:
-                    encoding["image"] = image_features.pop("pixel_values")
 
                 num_spans = len(encoding["input_ids"])
 
@@ -356,27 +328,20 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
 
                     # For each span, place a bounding box [0,0,0,0] for question and CLS tokens, [1000,1000,1000,1000]
                     # for SEP tokens, and the word's bounding box for words in the original document.
-                    if "boxes" not in tokenizer_kwargs:
-                        bbox = []
+                    bbox = []
+                    for i, s, w in zip(
+                        encoding.input_ids[span_idx],
+                        encoding.sequence_ids(span_idx),
+                        encoding.word_ids(span_idx),
+                    ):
+                        if s == 1:
+                            bbox.append(boxes[w])
+                        elif i == self.tokenizer.sep_token_id:
+                            bbox.append([1000] * 4)
+                        else:
+                            bbox.append([0] * 4)
 
-                        for input_id, sequence_id, word_id in zip(
-                            encoding.input_ids[span_idx],
-                            encoding.sequence_ids(span_idx),
-                            encoding.word_ids(span_idx),
-                        ):
-                            if sequence_id == 1:
-                                bbox.append(boxes[word_id])
-                            elif input_id == self.tokenizer.sep_token_id:
-                                bbox.append([1000] * 4)
-                            else:
-                                bbox.append([0] * 4)
-
-                        if self.framework == "pt":
-                            span_encoding["bbox"] = torch.tensor(bbox).unsqueeze(0)
-                        elif self.framework == "tf":
-                            raise ValueError(
-                                "Unsupported: Tensorflow preprocessing for DocumentQuestionAnsweringPipeline"
-                            )
+                    span_encoding["bbox"] = torch.tensor(bbox).unsqueeze(0)
 
                     yield {
                         **span_encoding,
@@ -395,7 +360,7 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
         if "overflow_to_sample_mapping" in model_inputs:
             model_inputs.pop("overflow_to_sample_mapping")
 
-        if self.model_type == ModelType.VisionEncoderDecoder:
+        if isinstance(self.model, VisionEncoderDecoderModel):
             model_outputs = self.model.generate(**model_inputs)
         else:
             model_outputs = self.model(**model_inputs)
@@ -408,23 +373,23 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
         return model_outputs
 
     def postprocess(self, model_outputs, top_k=1, **kwargs):
-        if self.model_type == ModelType.VisionEncoderDecoder:
+        if isinstance(self.model, VisionEncoderDecoderModel):
             answers = [self.postprocess_encoder_decoder_single(o) for o in model_outputs]
         else:
             answers = self.postprocess_extractive_qa(model_outputs, top_k=top_k, **kwargs)
 
         answers = sorted(answers, key=lambda x: x.get("score", 0), reverse=True)[:top_k]
+        if len(answers) == 1:
+            return answers[0]
         return answers
 
     def postprocess_encoder_decoder_single(self, model_outputs, **kwargs):
+        # postprocess
         sequence = self.tokenizer.batch_decode(model_outputs.sequences)[0]
-
-        # TODO: A lot of this logic is specific to Donut and should probably be handled in the tokenizer
-        # (see https://github.com/huggingface/transformers/pull/18414/files#r961747408 for more context).
         sequence = sequence.replace(self.tokenizer.eos_token, "").replace(self.tokenizer.pad_token, "")
         sequence = re.sub(r"<.*?>", "", sequence, count=1).strip()  # remove first task start token
         ret = {
-            "answer": None,
+            "answer": "",
         }
 
         answer = re.search(r"<s_answer>(.*)</s_answer>", sequence)
@@ -460,21 +425,21 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                 max_answer_len,
             )
             word_ids = output["word_ids"]
-            for start, end, score in zip(starts, ends, scores):
+            for s, e, score in zip(starts, ends, scores):
                 if "token_logits" in output:
                     predicted_token_classes = (
                         output["token_logits"][
                             0,
-                            start : end + 1,
+                            s : e + 1,
                         ]
                         .argmax(axis=1)
                         .cpu()
                         .numpy()
                     )
                     assert np.setdiff1d(predicted_token_classes, [0, 1]).shape == (0,)
-                    token_indices = np.flatnonzero(predicted_token_classes) + start
+                    token_indices = np.flatnonzero(predicted_token_classes) + s
                 else:
-                    token_indices = range(start, end + 1)
+                    token_indices = range(s, e + 1)
 
                 answer_word_ids = list(unique_everseen([word_ids[i] for i in token_indices]))
                 if len(answer_word_ids) > 0 and answer_word_ids[0] is not None and answer_word_ids[-1] is not None:
@@ -486,8 +451,5 @@ class DocumentQuestionAnsweringPipeline(ChunkPipeline):
                             "page": output["page"],
                         }
                     )
-
-        if handle_impossible_answer:
-            answers.append({"score": min_null_score, "answer": "", "start": 0, "end": 0})
 
         return answers

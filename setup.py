@@ -20,7 +20,11 @@ install_requires = [
     "pytesseract",  # TODO: Test what happens if the host machine does not have tesseract installed
     "requests",
     "easyocr",
-    "transformers >= 4.23",
+    "transformers >= 4.22.2",
+    "azure-cognitiveservices-vision-computervision",
+    "azure-common",
+    "azure-core"
+    
 ]
 extras_require = {
     "dev": [
